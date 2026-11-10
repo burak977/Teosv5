@@ -3,7 +3,8 @@ on:
   workflow_dispatch:
     inputs:
       rom_url:
-        description: "ROM zip / system.img link (https://www.mediafire.com/file/orrzaiplncdv6rt/Kasumi-1.5-PoPiPa-20260817-OFFICIAL-GApps-teos.zip/file?action=check)"
+        description: "ROM zip / system.img link"
+        default: "https://www.mediafire.com/file/orrzaiplncdv6rt/Kasumi-1.5-PoPiPa-20260817-OFFICIAL-GApps-teos.zip/file"
         required: true
 jobs:
   recon6:
@@ -11,23 +12,34 @@ jobs:
     timeout-minutes: 90
     steps:
       - name: Install tools
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq android-sdk-libsparse-utils brotli unzip binutils
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq android-sdk-libsparse-utils brotli unzip binutils python3-pip aria2
+          pip install playwright --break-system-packages -q
+          playwright install chromium
       - name: Download ROM
         run: |
           set -e
-          mkdir -p $GITHUB_WORKSPACE/rom && cd $GITHUB_WORKSPACE/rom
-          URL="${{ inputs.rom_url }}"
-          if echo "$URL" | grep -q 'mediafire.com/file'; then
-            HTML=$(curl -sL -A 'Mozilla/5.0' "$URL")
-            DL=$(echo "$HTML" | grep -oP 'https://download[0-9]*\.mediafire\.com/[^"'"'"' <>]+' | head -1)
-            if [ -z "$DL" ]; then
-              SC=$(echo "$HTML" | grep -oP 'data-scrambled-url="\K[^"]+' | head -1)
-              [ -n "$SC" ] && DL=$(echo "$SC" | base64 -d)
-            fi
-            [ -z "$DL" ] && { echo "Could not resolve the MediaFire direct link (page layout changed or link expired)."; exit 1; }
+          mkdir -p $GITHUB_WORKSPACE/rom && cd$GITHUB_WORKSPACE/rom
+          URL=$(echo "${{ inputs.rom_url }}" | sed 's/^Https:/https:/I')
+          if echo "$URL" | grep -qi 'mediafire.com/file'; then
+            cat > get_dl.py <<'EOF'
+          import sys
+          from playwright.sync_api import sync_playwright
+          with sync_playwright() as p:
+              b = p.chromium.launch(headless=True)
+              page = b.new_page()
+              page.goto(sys.argv[1], wait_until="domcontentloaded", timeout=60000)
+              page.wait_for_selector("a#downloadButton", timeout=30000)
+              href = page.get_attribute("a#downloadButton", "href")
+              print(href)
+              b.close()
+          EOF
+            DL=$(python3 get_dl.py "$URL" | tail -n 1)
+            echo "Resolved URL: $DL"
             URL="$DL"
           fi
-          curl -L --fail --retry 3 -A 'Mozilla/5.0' -o rom.bin "$URL"
+          aria2c -x 16 -s 16 -o rom.bin "$URL" || curl -L --fail --retry 3 -A 'Mozilla/5.0' -o rom.bin "$URL"
           ls -la rom.bin; file rom.bin
       - name: Unpack to ext4 images
         run: |
@@ -66,12 +78,12 @@ jobs:
           PY
           conv() {
             n=$1
-            [ -f $n.new.dat.br ] && brotli -d -f $n.new.dat.br
-            if [ -f $n.new.dat ] && [ -f $n.transfer.list ]; then python3 sdat2img.py $n.transfer.list $n.new.dat $n.raw.img
+            [ -f $n.new.dat.br ] && brotli -d -f$n.new.dat.br
+            if [ -f $n.new.dat ] && [ -f$n.transfer.list ]; then python3 sdat2img.py $n.transfer.list $n.new.dat $n.raw.img
             elif [ -f $n.img ]; then cp $n.img $n.raw.img; fi
-            [ -f $n.raw.img ] || { echo "no $n image"; return 0; }
+            [ -f $n.raw.img ] \vert{}\vert{} { echo "no $n image"; return 0; }
             if file $n.raw.img | grep -qi sparse; then simg2img $n.raw.img $n.ext4.img; else mv $n.raw.img $n.ext4.img; fi
-            rm -f $n.new.dat $n.raw.img $n.img; file $n.ext4.img
+            rm -f $n.new.dat $n.raw.img $n.img; file$n.ext4.img
           }
           for n in system vendor odm product; do conv $n; done
       - name: Mount and collect
@@ -80,41 +92,30 @@ jobs:
           W=$GITHUB_WORKSPACE; R=$W/recon6
           mkdir -p $R/files
           cp $W/rom/ziplist.txt $W/rom/dirlist.txt $R/ 2>/dev/null
-          # flashing logic and boot/dtbo images of the working ROM
-          cp -r $W/rom/META-INF $R/ 2>/dev/null
-          cp $W/rom/dynamic_partitions_op_list $R/ 2>/dev/null
-          for b in boot.img dtbo.img vbmeta.img; do [ -f $W/rom/$b ] && cp $W/rom/$b $R/; done
-          mnt() { d=$W/mnt_$1; mkdir -p $d; [ -f $W/rom/$1.ext4.img ] && sudo mount -o loop,ro $W/rom/$1.ext4.img $d && echo $d; }
+          cp -r $W/rom/META-INF$R/ 2>/dev/null
+          cp $W/rom/dynamic_partitions_op_list$R/ 2>/dev/null
+          for b in boot.img dtbo.img vbmeta.img; do [ -f $W/rom/$b ] && cp$W/rom/$b$R/; done
+          mnt() { d=$W/mnt_$1; mkdir -p $d; [ -f$W/rom/$1.ext4.img ] && sudo mount -o loop,ro $W/rom/$1.ext4.img $d && echo$d; }
           SYS=$(mnt system); VEN=$(mnt vendor)
           S=$SYS; [ -d $SYS/system/bin ] && S=$SYS/system
           V=$VEN; [ -z "$V" ] && V=$S/vendor
           echo "SYS=$SYS S=$S VEN=$VEN V=$V" > $R/layout.txt
-          ls $SYS | head -60 > $R/root_ls.txt
+          ls $SYS \vert{} head -60 >$R/root_ls.txt
           for pair in "system:$S" "vendor:$V"; do
-            n=${pair%%:*}; base=${pair#*:}
+            n=${pair\%\%:*}; base=${pair#*:}
             for d in lib lib64 bin etc; do
-              [ -d $base/$d ] && (cd $base && find $d -type f -printf '%s %p\n' | sort -k2) > $R/inv_${n}_$d.txt
+              [ -d $base/$d ] && (cd$base && find $d -type f -printf '\%s \%p\n' \vert{} sort -k2) >$R/inv_${n}_$d.txt
             done
             cp $base/build.prop $R/${n}_build.prop 2>/dev/null
             mkdir -p $R/files/$n
-            # manifests, init scripts, config xml
             (cd $base && tar cf - etc/vintf manifest.xml etc/init etc/*.xml etc/*.conf 2>/dev/null) | tar xf - -C $R/files/$n
-            # every HAL library and HAL service binary
             (cd $base && find lib/hw lib64/hw bin/hw -type f 2>/dev/null) > $R/hal_list_$n.txt
             (cd $base && tar cf - -T $R/hal_list_$n.txt 2>/dev/null) | tar xf - -C $R/files/$n
-            # display / audio / sensor / ril support libs
             (cd $base && ls lib/libqdutils.so lib/libqdMetaData.so lib/libqservice.so lib/libsdm*.so lib/libgralloc* lib/libmemalloc.so lib/libgenlock.so lib/libcopybit* lib/libhwcservice.so lib/libaudcal*.so lib/libacdbloader.so lib/libsensor*.so lib/libril*.so lib/libwifi-hal-qcom.so lib/libshim_*.so lib64/libqdutils.so lib64/libqdMetaData.so lib64/libqservice.so lib64/libgralloc* lib64/libmemalloc.so lib64/libshim_*.so 2>/dev/null) > $R/support_libs_$n.txt
             (cd $base && tar cf - -T $R/support_libs_$n.txt 2>/dev/null) | tar xf - -C $R/files/$n
             (cd $base && find . -name '*.ko' 2>/dev/null) > $R/ko_list_$n.txt
             (cd $base && tar cf - -T $R/ko_list_$n.txt 2>/dev/null) | tar xf - -C $R/files/$n
           done
           find $R/files -type f | while read f; do file "$f" | grep -q ELF || continue; echo "== ${f#$R/files/}"; readelf -d "$f" 2>/dev/null | grep NEEDED | sed 's/.*\[\(.*\)\]/\1/'; done > $R/needed_collected.txt
-          du -sh $R; find $R -type f | wc -l
+          du -sh $R; find$R -type f | wc -l
           sudo umount $W/mnt_* 2>/dev/null
-          tar czf $W/recon6.tgz -C $W recon6
-          ls -la $W/recon6.tgz
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: recon6
-          path: recon6.tgz
