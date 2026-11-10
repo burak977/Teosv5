@@ -1,0 +1,50 @@
+name: recon5-vendor-plan
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch of the Codeberg teos repos"
+        default: "lineage-15.1"
+jobs:
+  recon5:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Clone teos repos
+        run: |
+          B="${{ inputs.branch }}"
+          for r in android_device_vestel_teos android_device_vestel_common proprietary_vendor_vestel_teos; do
+            git clone --depth 1 --branch "$B" https://codeberg.org/kurtbahartr/$r $r || git clone --depth 1 https://codeberg.org/kurtbahartr/$r $r
+          done
+      - name: Collect
+        run: |
+          set +e
+          R=$GITHUB_WORKSPACE/recon5
+          mkdir -p $R/dev $R/common $R/vendor
+          cd $GITHUB_WORKSPACE/android_device_vestel_teos
+          cp -r --parents BoardConfig.mk device.mk lineage.mk manifest.xml system.prop proprietary-files.txt extract-files.sh configs rootdir libshims include seccomp_policy $R/dev/ 2>/dev/null
+          find sepolicy -type f > $R/dev/sepolicy_files.txt
+          cp -r --parents sepolicy $R/dev/
+          cd $GITHUB_WORKSPACE/android_device_vestel_common
+          cp -r --parents $(ls -A | grep -v '^.git$') $R/common/ 2>/dev/null
+          # vendor blobs: do NOT ship 236 MB; list + ELF dependency analysis
+          cd $GITHUB_WORKSPACE/proprietary_vendor_vestel_teos
+          cp teos-vendor.mk BoardConfigVendor.mk Android.mk $R/vendor/ 2>/dev/null
+          find proprietary -type f -printf '%s %p\n' | sort -k2 > $R/vendor/files.txt
+          find proprietary -name '*.so' -o -type f -perm -u+x | while read f; do
+            file "$f" | grep -q ELF || continue
+            echo "== $f"; readelf -d "$f" 2>/dev/null | grep NEEDED | sed 's/.*\[\(.*\)\]/\1/'
+          done > $R/vendor/needed_raw.txt
+          grep -v '^==' $R/vendor/needed_raw.txt | sort | uniq -c | sort -rn > $R/vendor/needed_count.txt
+          find proprietary -type f -exec basename {} \; | sort -u > $R/vendor/provided.txt
+          awk '{print $2}' $R/vendor/needed_count.txt | grep -vxFf $R/vendor/provided.txt > $R/vendor/needed_not_in_vendor.txt
+          # init rc / hal service binaries present in the blobs
+          find proprietary -name '*.rc' -o -path '*bin/hw/*' | sort > $R/vendor/rc_and_hal_bins.txt
+          find proprietary -name '*.so' -path '*hw*' | sort > $R/vendor/hal_libs.txt
+          du -sh $R; find $R -type f | wc -l
+          tar czf $GITHUB_WORKSPACE/recon5.tgz -C $GITHUB_WORKSPACE recon5
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: recon5
+          path: recon5.tgz
