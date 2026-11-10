@@ -1,0 +1,122 @@
+name: recon6-rom-extract
+on:
+  workflow_dispatch:
+    inputs:
+      rom_url:
+        description: "ROM zip / system.img link (MediaFire file page links are resolved automatically)"
+        required: true
+jobs:
+  recon6:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Install tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq android-sdk-libsparse-utils brotli unzip binutils
+      - name: Download ROM
+        run: |
+          set -e
+          mkdir -p $GITHUB_WORKSPACE/rom && cd $GITHUB_WORKSPACE/rom
+          URL="${{ inputs.rom_url }}"
+          if echo "$URL" | grep -q 'mediafire.com/file'; then
+            HTML=$(curl -sL -A 'Mozilla/5.0' "$URL")
+            DL=$(echo "$HTML" | grep -oP 'https://download[0-9]*\.mediafire\.com/[^"'"'"' <>]+' | head -1)
+            if [ -z "$DL" ]; then
+              SC=$(echo "$HTML" | grep -oP 'data-scrambled-url="\K[^"]+' | head -1)
+              [ -n "$SC" ] && DL=$(echo "$SC" | base64 -d)
+            fi
+            [ -z "$DL" ] && { echo "Could not resolve the MediaFire direct link (page layout changed or link expired)."; exit 1; }
+            URL="$DL"
+          fi
+          curl -L --fail --retry 3 -A 'Mozilla/5.0' -o rom.bin "$URL"
+          ls -la rom.bin; file rom.bin
+      - name: Unpack to ext4 images
+        run: |
+          set -e
+          cd $GITHUB_WORKSPACE/rom
+          file rom.bin | tee filetype.txt
+          if [ "$(head -c 2 rom.bin)" = "PK" ]; then
+            unzip -l rom.bin > ziplist.txt
+            unzip -q -o rom.bin
+            rm rom.bin
+          else
+            mv rom.bin system.img
+          fi
+          ls -la | tee dirlist.txt
+          cat > sdat2img.py <<'PY'
+          import sys,os
+          tl,dat,out=sys.argv[1:4]
+          L=open(tl).read().split('\n')
+          ver=int(L[0]); total=int(L[1])
+          start=2 if ver==1 else 4
+          def rs(s):
+              n=[int(x) for x in s.split(',')]
+              assert len(n)==n[0]+1
+              return [(n[i],n[i+1]) for i in range(1,len(n),2)]
+          with open(out,'wb') as o, open(dat,'rb') as d:
+              o.truncate(total*4096)
+              for line in L[start:]:
+                  p=line.split(' ')
+                  if p[0]=='new':
+                      for b,e in rs(p[1]):
+                          o.seek(b*4096); n=(e-b)*4096
+                          while n>0:
+                              c=d.read(min(n,1<<20))
+                              if not c: raise SystemExit('dat truncated')
+                              o.write(c); n-=len(c)
+          print('ok',total*4096)
+          PY
+          conv() {
+            n=$1
+            [ -f $n.new.dat.br ] && brotli -d -f $n.new.dat.br
+            if [ -f $n.new.dat ] && [ -f $n.transfer.list ]; then python3 sdat2img.py $n.transfer.list $n.new.dat $n.raw.img
+            elif [ -f $n.img ]; then cp $n.img $n.raw.img; fi
+            [ -f $n.raw.img ] || { echo "no $n image"; return 0; }
+            if file $n.raw.img | grep -qi sparse; then simg2img $n.raw.img $n.ext4.img; else mv $n.raw.img $n.ext4.img; fi
+            rm -f $n.new.dat $n.raw.img $n.img; file $n.ext4.img | tee -a convert_log.txt
+          }
+          for n in system vendor odm product; do conv $n; done
+      - name: Mount and collect
+        run: |
+          set +e
+          W=$GITHUB_WORKSPACE; R=$W/recon6
+          mkdir -p $R/files
+          cp $W/rom/ziplist.txt $W/rom/dirlist.txt $W/rom/filetype.txt $W/rom/convert_log.txt $R/ 2>/dev/null
+          ls -la $W/rom > $R/rom_after_unpack.txt
+          # flashing logic and boot/dtbo images of the working ROM
+          cp -r $W/rom/META-INF $R/ 2>/dev/null
+          cp $W/rom/dynamic_partitions_op_list $R/ 2>/dev/null
+          for b in boot.img dtbo.img vbmeta.img; do [ -f $W/rom/$b ] && cp $W/rom/$b $R/; done
+          mnt() { d=$W/mnt_$1; mkdir -p $d; [ -f $W/rom/$1.ext4.img ] && sudo mount -o loop,ro $W/rom/$1.ext4.img $d 2>$R/mount_err_$1.txt && echo $d; }
+          SYS=$(mnt system); VEN=$(mnt vendor)
+          S=$SYS; [ -d $SYS/system/bin ] && S=$SYS/system
+          V=$VEN; [ -z "$V" ] && V=$S/vendor
+          echo "SYS=$SYS S=$S VEN=$VEN V=$V" > $R/layout.txt
+          ls $SYS | head -60 > $R/root_ls.txt
+          for pair in "system:$S" "vendor:$V"; do
+            n=${pair%%:*}; base=${pair#*:}
+            for d in lib lib64 bin etc; do
+              [ -d $base/$d ] && (cd $base && find $d -type f -printf '%s %p\n' | sort -k2) > $R/inv_${n}_$d.txt
+            done
+            cp $base/build.prop $R/${n}_build.prop 2>/dev/null
+            mkdir -p $R/files/$n
+            # manifests, init scripts, config xml
+            (cd $base && tar cf - etc/vintf manifest.xml etc/init etc/*.xml etc/*.conf 2>/dev/null) | tar xf - -C $R/files/$n
+            # every HAL library and HAL service binary
+            (cd $base && find lib/hw lib64/hw bin/hw -type f 2>/dev/null) > $R/hal_list_$n.txt
+            (cd $base && tar cf - -T $R/hal_list_$n.txt 2>/dev/null) | tar xf - -C $R/files/$n
+            # display / audio / sensor / ril support libs
+            (cd $base && ls lib/libqdutils.so lib/libqdMetaData.so lib/libqservice.so lib/libsdm*.so lib/libgralloc* lib/libmemalloc.so lib/libgenlock.so lib/libcopybit* lib/libhwcservice.so lib/libaudcal*.so lib/libacdbloader.so lib/libsensor*.so lib/libril*.so lib/libwifi-hal-qcom.so lib/libshim_*.so lib64/libqdutils.so lib64/libqdMetaData.so lib64/libqservice.so lib64/libgralloc* lib64/libmemalloc.so lib64/libshim_*.so 2>/dev/null) > $R/support_libs_$n.txt
+            (cd $base && tar cf - -T $R/support_libs_$n.txt 2>/dev/null) | tar xf - -C $R/files/$n
+            (cd $base && find . -name '*.ko' 2>/dev/null) > $R/ko_list_$n.txt
+            (cd $base && tar cf - -T $R/ko_list_$n.txt 2>/dev/null) | tar xf - -C $R/files/$n
+          done
+          find $R/files -type f | while read f; do file "$f" | grep -q ELF || continue; echo "== ${f#$R/files/}"; readelf -d "$f" 2>/dev/null | grep NEEDED | sed 's/.*\[\(.*\)\]/\1/'; done > $R/needed_collected.txt
+          du -sh $R; find $R -type f | wc -l
+          sudo umount $W/mnt_* 2>/dev/null
+          tar czf $W/recon6.tgz -C $W recon6
+          ls -la $W/recon6.tgz
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: recon6
+          path: recon6.tgz
