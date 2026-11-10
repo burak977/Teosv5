@@ -1,0 +1,196 @@
+name: recon7-stock-rom
+on:
+  workflow_dispatch:
+    inputs:
+      rom_url:
+        description: "Stock ROM link (Google Drive / MediaFire page links or direct URL)"
+        required: true
+        default: "https://drive.google.com/file/d/1S8kikSVSJQxat52PziaUJo5KktWk6IHX/view"
+jobs:
+  recon7:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq android-sdk-libsparse-utils brotli unzip binutils p7zip-full python3-pip
+          pip install --break-system-packages -q gdown
+      - name: Download
+        run: |
+          set -e
+          mkdir -p $GITHUB_WORKSPACE/rom && cd $GITHUB_WORKSPACE/rom
+          URL="${{ inputs.rom_url }}"
+          if echo "$URL" | grep -q 'drive.google.com'; then
+            gdown --fuzzy "$URL" -O rom.bin
+          elif echo "$URL" | grep -q 'mediafire.com/file'; then
+            HTML=$(curl -sL -A 'Mozilla/5.0' "$URL")
+            DL=$(echo "$HTML" | grep -oP 'https://download[0-9]*\.mediafire\.com/[^"'"'"' <>]+' | head -1)
+            [ -z "$DL" ] && { SC=$(echo "$HTML" | grep -oP 'data-scrambled-url="\K[^"]+' | head -1); [ -n "$SC" ] && DL=$(echo "$SC" | base64 -d); }
+            [ -z "$DL" ] && { echo "MediaFire link not resolved"; exit 1; }
+            curl -L --fail --retry 3 -A 'Mozilla/5.0' -o rom.bin "$DL"
+          else
+            curl -L --fail --retry 3 -A 'Mozilla/5.0' -o rom.bin "$URL"
+          fi
+          ls -la rom.bin; file rom.bin | tee filetype.txt
+          df -h / | tail -1
+      - name: Unpack
+        run: |
+          set -e
+          cd $GITHUB_WORKSPACE/rom
+          if [ "$(head -c 2 rom.bin)" = "PK" ]; then
+            unzip -l rom.bin > ziplist.txt; unzip -q -o rom.bin; rm rom.bin
+          else
+            7z x -y rom.bin > 7z_log.txt || { echo "unknown archive type"; exit 1; }; rm rom.bin
+          fi
+          # nested archives (names may contain spaces); delete each archive after extracting to save disk
+          for round in 1 2; do
+            find . -maxdepth 5 -type f \( -iname '*.zip' -o -iname '*.rar' -o -iname '*.7z' \) -print0 | while IFS= read -r -d '' z; do
+              d="${z%.*}_x"; mkdir -p "$d"
+              case "$(echo "$z" | tr 'A-Z' 'a-z')" in
+                *.zip) unzip -l "$z" > "$d/ziplist.txt" 2>&1; unzip -q -o "$z" -d "$d" || true ;;
+                *) 7z x -y -o"$d" "$z" > "$d/7z_log.txt" 2>&1 || true ;;
+              esac
+              rm -f "$z"
+            done
+          done
+          df -h / | tail -1
+          find . -type f -printf '%s %p\n' | sort -k2 > file_inventory.txt
+          wc -l file_inventory.txt; head -80 file_inventory.txt
+          cat > sdat2img.py <<'PY'
+          import sys,os
+          tl,dat,out=sys.argv[1:4]
+          L=open(tl).read().split('\n')
+          ver=int(L[0]); total=int(L[1])
+          start=2 if ver==1 else 4
+          def rs(s):
+              n=[int(x) for x in s.split(',')]
+              assert len(n)==n[0]+1
+              return [(n[i],n[i+1]) for i in range(1,len(n),2)]
+          with open(out,'wb') as o, open(dat,'rb') as d:
+              o.truncate(total*4096)
+              for line in L[start:]:
+                  p=line.split(' ')
+                  if p[0]=='new':
+                      for b,e in rs(p[1]):
+                          o.seek(b*4096); n=(e-b)*4096
+                          while n>0:
+                              c=d.read(min(n,1<<20))
+                              if not c: raise SystemExit('dat truncated')
+                              o.write(c); n-=len(c)
+          print('ok',total*4096)
+          PY
+          cat > assemble.py <<'PY2'
+          import sys,os,glob
+          import xml.etree.ElementTree as ET
+          label,out,root=sys.argv[1:4]
+          min_sectors=int(sys.argv[4]) if len(sys.argv)>4 else 0
+          xs=[os.path.join(root,'rawprogram_without_vfactory.xml')]+sorted(glob.glob(os.path.join(root,'rawprogram*.xml')))
+          x=next(p for p in xs if os.path.exists(p))
+          rows=[e.attrib for e in ET.parse(x).getroot().iter('program') if e.attrib.get('label')==label and e.attrib.get('filename')]
+          if not rows: raise SystemExit('no rows for '+label)
+          base=min(int(r['start_sector']) for r in rows)
+          end=max(int(r['start_sector'])+int(r['num_partition_sectors']) for r in rows)
+          with open(out,'wb') as o:
+              o.truncate(max(end-base,min_sectors)*512)
+              for r in rows:
+                  src=os.path.join(root,r['filename'])
+                  if not os.path.exists(src): print('missing',src); continue
+                  n=int(r['num_partition_sectors'])*512
+                  with open(src,'rb') as f:
+                      f.seek(int(r.get('file_sector_offset','0'))*512)
+                      o.seek((int(r['start_sector'])-base)*512)
+                      while n>0:
+                          c=f.read(min(n,1<<20))
+                          if not c: break
+                          o.write(c); n-=len(c)
+          print('assembled',label,os.path.getsize(out),'bytes from',len(rows),'chunks')
+          PY2
+      - name: Build system ext4 image
+        run: |
+          set +e
+          cd $GITHUB_WORKSPACE/rom
+          OUT=$GITHUB_WORKSPACE/rom/system.raw.img
+          SCR=$GITHUB_WORKSPACE/rom/sdat2img.py
+          X=$(find . -name 'rawprogram_without_vfactory.xml' | head -1); [ -z "$X" ] && X=$(find . -name 'rawprogram0.xml' | head -1)
+          if [ -n "$X" ]; then
+            D=$(dirname "$X")
+            python3 "$GITHUB_WORKSPACE/rom/assemble.py" system "$OUT" "$D" 8388608
+            python3 "$GITHUB_WORKSPACE/rom/assemble.py" oem oem.ext4.img "$D" 524288
+            df -h / | tail -1
+          fi
+          S=$(find . -name 'system.new.dat.br' | head -1)
+          if [ -n "$S" ] && [ ! -f "$OUT" ]; then d=$(dirname "$S"); (cd "$d" && brotli -d -f system.new.dat.br && python3 "$SCR" system.transfer.list system.new.dat "$OUT" && rm -f system.new.dat); fi
+          S=$(find . -name 'system.new.dat' | head -1)
+          if [ -n "$S" ] && [ ! -f "$OUT" ]; then d=$(dirname "$S"); (cd "$d" && python3 "$SCR" system.transfer.list system.new.dat "$OUT" && rm -f system.new.dat); fi
+          if [ ! -f "$OUT" ]; then
+            mapfile -t CH < <(find . -name 'system.img_sparsechunk.*' | sort -V)
+            [ ${#CH[@]} -eq 0 ] && mapfile -t CH < <(find . -name 'system_[0-9]*.img' -o -name 'system.img.[0-9]*' | sort -V)
+            [ ${#CH[@]} -gt 0 ] && simg2img "${CH[@]}" "$OUT"
+          fi
+          if [ ! -f "$OUT" ]; then S=$(find . -name 'system.img' | head -1); [ -n "$S" ] && cp "$S" "$OUT"; fi
+          if [ -f "$OUT" ]; then
+            if file "$OUT" | grep -qi sparse; then simg2img "$OUT" system.ext4.img; rm -f "$OUT"; else mv "$OUT" system.ext4.img; fi
+            file system.ext4.img | tee convert_log.txt
+          else echo "no system image found" | tee convert_log.txt; fi
+          df -h / | tail -1
+      - name: Collect
+        run: |
+          set +e
+          W=$GITHUB_WORKSPACE; R=$W/recon7
+          mkdir -p $R/files $R/small
+          cp $W/rom/file_inventory.txt $W/rom/ziplist.txt $W/rom/filetype.txt $W/rom/convert_log.txt $R/ 2>/dev/null
+          # flashing metadata + partition tables + boot/recovery + small text files from anywhere in the package
+          find $W/rom -type f \( -iname '*.xml' -o -iname 'gpt*.bin' -o -iname 'partition*' -o -iname '*.mbn' -o -iname 'updater-script' -o -iname '*.txt' -o -iname '*.cfg' -o -iname '*.sh' -o -iname '*.bat' -o -iname '*.json' -o -iname '*.prop' \) -size -3M -not -name 'file_inventory.txt' -not -name 'ziplist.txt' | head -400 | while IFS= read -r f; do cp --parents "$f" $R/small/ 2>/dev/null; done
+          for b in boot.img recovery.img; do f=$(find $W/rom -name $b | head -1); [ -n "$f" ] && cp "$f" $R/; done
+          find $W/rom -type f -printf '%s %p\n' | sort -k2 > $R/file_inventory_after_unpack.txt
+          IMG=$W/rom/system.ext4.img
+          if [ -f $IMG ]; then
+            d=$W/mnt_system; mkdir -p $d
+            sudo mount -o loop,ro $IMG $d 2>$R/mount_err.txt && SYS=$d
+            if [ -z "$SYS" ]; then
+              sudo dmesg | tail -8 > $R/dmesg_tail.txt
+              dumpe2fs -h $IMG > $R/dumpe2fs.txt 2>&1
+              debugfs -R "ls -l /" $IMG > $R/debugfs_root.txt 2>&1
+              mkdir -p $W/rootfs
+              for p in vendor system/vendor system/bin system/etc system/lib system/lib64 system/build.prop bin etc lib lib64 build.prop; do
+                mkdir -p $W/rootfs/$(dirname $p)
+                debugfs -R "rdump /$p $W/rootfs/$(dirname $p)" $IMG > /dev/null 2>&1
+              done
+              SYS=$W/rootfs
+            fi
+            S=$SYS; [ -d $SYS/system/bin ] && S=$SYS/system
+            V=$S/vendor; [ -d "$V/lib" ] || V=$SYS/vendor
+            echo "SYS=$SYS S=$S V=$V" > $R/layout.txt; ls $SYS | head -60 > $R/root_ls.txt
+            for pair in "system:$S" "vendor:$V"; do
+              n=${pair%%:*}; base=${pair#*:}
+              for dd in lib lib64 bin etc; do [ -d $base/$dd ] && (cd $base && find $dd -type f -printf '%s %p\n' | sort -k2) > $R/inv_${n}_$dd.txt; done
+              cp $base/build.prop $R/${n}_build.prop 2>/dev/null
+              mkdir -p $R/files/$n
+              (cd $base && tar cf - etc/vintf manifest.xml etc/init etc/*.xml etc/*.conf etc/permissions init*.rc 2>/dev/null) | tar xf - -C $R/files/$n
+              (cd $base && find lib/hw lib64/hw bin/hw -type f 2>/dev/null) > $R/hal_list_$n.txt
+              (cd $base && tar cf - -T $R/hal_list_$n.txt 2>/dev/null) | tar xf - -C $R/files/$n
+              (cd $base && find . -name '*.ko' 2>/dev/null) > $R/ko_list_$n.txt
+              (cd $base && tar cf - -T $R/ko_list_$n.txt 2>/dev/null) | tar xf - -C $R/files/$n
+            done
+            find $R/files -type f | while read f; do file "$f" | grep -q ELF || continue; echo "== ${f#$R/files/}"; readelf -d "$f" 2>/dev/null | grep NEEDED | sed 's/.*\[\(.*\)\]/\1/'; done > $R/needed_collected.txt
+            sudo umount $d 2>/dev/null
+          fi
+          if [ -f $W/rom/oem.ext4.img ]; then
+            file $W/rom/oem.ext4.img > $R/oem_file.txt
+            mkdir -p $W/mnt_oem
+            if sudo mount -o loop,ro $W/rom/oem.ext4.img $W/mnt_oem 2>$R/oem_mount_err.txt; then
+              (cd $W/mnt_oem && find . -type f -printf '%s %p\n' | sort -k2 | head -3000) > $R/inv_oem.txt
+              df -h $W/mnt_oem | tail -1 > $R/oem_df.txt
+              sudo umount $W/mnt_oem
+            else
+              debugfs -R "ls -l /" $W/rom/oem.ext4.img > $R/oem_debugfs_root.txt 2>&1
+            fi
+          fi
+          du -sh $R; find $R -type f | wc -l
+          tar czf $W/recon7.tgz -C $W recon7; ls -la $W/recon7.tgz
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: recon7
+          path: recon7.tgz
