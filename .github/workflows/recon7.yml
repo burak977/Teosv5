@@ -22,7 +22,9 @@ jobs:
           mkdir -p $GITHUB_WORKSPACE/rom && cd $GITHUB_WORKSPACE/rom
           URL="${{ inputs.rom_url }}"
           if echo "$URL" | grep -q 'drive.google.com'; then
-            gdown --fuzzy "$URL" -O rom.bin
+            FILE_ID=$(echo "$URL" | sed -rn 's/.*\/d\/([a-zA-Z0-9_-]+).*/\1/p')
+            [ -z "$FILE_ID" ] && FILE_ID=$(echo "$URL" | sed -rn 's/.*id=([a-zA-Z0-9_-]+).*/\1/p')
+            gdown "$FILE_ID" -O rom.bin
           elif echo "$URL" | grep -q 'mediafire.com/file'; then
             HTML=$(curl -sL -A 'Mozilla/5.0' "$URL")
             DL=$(echo "$HTML" | grep -oP 'https://download[0-9]*\.mediafire\.com/[^"'"'"' <>]+' | head -1)
@@ -43,7 +45,6 @@ jobs:
           else
             7z x -y rom.bin > 7z_log.txt || { echo "unknown archive type"; exit 1; }; rm rom.bin
           fi
-          # one level of nested archives
           for z in $(find . -maxdepth 3 -iname '*.zip' | head -20); do d=${z%.zip}; mkdir -p "$d"; unzip -q -o "$z" -d "$d" || true; done
           find . -type f -printf '%s %p\n' | sort -k2 > file_inventory.txt
           wc -l file_inventory.txt; head -80 file_inventory.txt
@@ -97,7 +98,6 @@ jobs:
           W=$GITHUB_WORKSPACE; R=$W/recon7
           mkdir -p $R/files $R/small
           cp $W/rom/file_inventory.txt $W/rom/ziplist.txt $W/rom/filetype.txt $W/rom/convert_log.txt $R/ 2>/dev/null
-          # flashing metadata + partition tables + boot/recovery + small text files from anywhere in the package
           find $W/rom -type f \( -iname '*.xml' -o -iname 'gpt*.bin' -o -iname 'partition*' -o -iname '*.mbn' -o -iname 'updater-script' -o -iname '*.txt' -o -iname '*.cfg' -o -iname '*.sh' -o -iname '*.bat' -o -iname '*.json' -o -iname '*.prop' \) -size -3M -not -name 'file_inventory.txt' -not -name 'ziplist.txt' | head -400 | while read f; do cp --parents "$f" $R/small/ 2>/dev/null; done
           for b in boot.img recovery.img; do f=$(find $W/rom -name $b | head -1); [ -n "$f" ] && cp "$f" $R/; done
           IMG=$W/rom/system.ext4.img
