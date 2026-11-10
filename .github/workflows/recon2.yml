@@ -1,0 +1,59 @@
+name: recon2-sources
+on:
+  workflow_dispatch:
+    inputs:
+      branch419:
+        description: "4.19 kernel branch (LineageOS msm8937)"
+        default: "lineage-23.2"
+      branch318:
+        description: "Codeberg vestel 3.18 branch"
+        default: "lineage-18.1"
+jobs:
+  recon2:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Clone sources
+        run: |
+          git clone --depth 1 --branch "${{ inputs.branch419 }}" https://github.com/LineageOS/android_kernel_xiaomi_msm8937 k419
+          git clone --depth 1 --branch "${{ inputs.branch318 }}" https://codeberg.org/kurtbahartr/android_kernel_vestel_msm8920 k318
+      - name: Collect round 2
+        run: |
+          set +e
+          R=$GITHUB_WORKSPACE/recon2
+          mkdir -p $R/419 $R/318
+          cd $GITHUB_WORKSPACE/k419
+          # dt-bindings headers needed to resolve macros
+          cp --parents include/dt-bindings/iio/qcom,spmi-vadc.h include/dt-bindings/input/qcom,qpnp-power-on.h \
+            include/dt-bindings/spmi/spmi.h include/dt-bindings/interrupt-controller/irq.h include/dt-bindings/gpio/gpio.h $R/419/
+          # camera stack + touchscreen Kconfig/Makefile
+          find drivers/media/platform/msm drivers/input/touchscreen -maxdepth 4 \( -name Kconfig -o -name Makefile \) > $R/l1
+          echo drivers/input/Kconfig >> $R/l1; echo drivers/input/Makefile >> $R/l1
+          xargs -a $R/l1 -I{} cp --parents {} $R/419/
+          cp --parents drivers/media/platform/msm/camera_v2/sensor/msm_sensor_driver.c $R/419/
+          # config fragments (how the Mi8937 config is assembled)
+          cp -r --parents arch/arm64/configs/vendor/xiaomi arch/arm64/configs/vendor/feature arch/arm64/configs/vendor/common.config \
+            arch/arm64/configs/vendor/msm8937_defconfig arch/arm64/configs/vendor/msm8937-perf_defconfig \
+            arch/arm64/configs/vendor/msm8937-legacy.config arch/arm64/configs/vendor/qualcomm $R/419/
+          # device trees: Xiaomi msm8937 devices (PMI8950 ones are the template) + SoC dtsi
+          cp -r --parents arch/arm64/boot/dts/xiaomi-msm8937 $R/419/
+          ls arch/arm64/boot/dts/vendor-legacy/qcom | grep -E '^(msm89|msm-pm8937|msm-pmi|msm-gdsc|pm8937|pmi89|msm-audio|msm-rdbg|msm-iommu)' > $R/l2
+          sed 's#^#arch/arm64/boot/dts/vendor-legacy/qcom/#' $R/l2 | xargs -I{} cp --parents {} $R/419/
+          cp --parents arch/arm64/boot/dts/vendor-legacy/qcom/Makefile $R/419/
+          ls arch/arm64/boot/dts/vendor-legacy/qcom | head -400 > $R/419/vendor_legacy_qcom_ls.txt
+          # ---------- 3.18 Vestel tree ----------
+          cd $GITHUB_WORKSPACE/k318
+          cp -r --parents drivers/input/touchscreen/focaltech_touch drivers/input/hall_sensor.c $R/318/
+          cp --parents drivers/input/touchscreen/Kconfig drivers/input/touchscreen/Makefile drivers/input/Kconfig drivers/input/Makefile $R/318/
+          cp --parents drivers/media/platform/msm/camera_v2/sensor/msm_sensor_driver.c $R/318/
+          git log --oneline -n 60 > $R/318/log60.txt
+          git log --oneline -n 60 -- drivers/media/platform/msm drivers/input arch/arm/boot/dts/qcom/msm8920-teos.dtsi > $R/318/log_relevant.txt
+          cp arch/arm64/configs/teos_defconfig $R/318/
+          du -sh $R; find $R -type f | wc -l
+          tar czf $GITHUB_WORKSPACE/recon2.tgz -C $GITHUB_WORKSPACE recon2
+          ls -la $GITHUB_WORKSPACE/recon2.tgz
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: recon2
+          path: recon2.tgz
