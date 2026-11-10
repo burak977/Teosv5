@@ -1,0 +1,65 @@
+name: recon3-sources
+on:
+  workflow_dispatch:
+    inputs:
+      branch419:
+        description: "4.19 kernel branch (LineageOS msm8937)"
+        default: "lineage-23.2"
+      branch318:
+        description: "Codeberg vestel 3.18 branch"
+        default: "lineage-18.1"
+jobs:
+  recon3:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Clone sources
+        run: |
+          git clone --depth 1 --branch "${{ inputs.branch419 }}" https://github.com/LineageOS/android_kernel_xiaomi_msm8937 k419
+          git clone --depth 1 --branch "${{ inputs.branch318 }}" https://codeberg.org/kurtbahartr/android_kernel_vestel_msm8920 k318
+      - name: Collect round 3
+        run: |
+          set +e
+          R=$GITHUB_WORKSPACE/recon3
+          mkdir -p $R/419 $R/318
+          # ================= 3.18 Vestel: the real V5 hardware description =================
+          cd $GITHUB_WORKSPACE/k318
+          # every file with teos in its name (dts/dtsi/Makefile hits)
+          find . -path ./.git -prune -o -iname '*teos*' -type f -print > $R/318/teos_files.txt
+          xargs -a $R/318/teos_files.txt -I{} cp --parents {} $R/318/
+          # resolve #include "x.dtsi" one/two levels from the teos dts files and copy them too
+          for pass in 1 2; do
+            for f in $(find $R/318 -name '*.dts*' -type f); do
+              d=$(dirname "${f#$R/318/}")
+              grep -hoE '#include +"[^"]+"' "$f" | sed -E 's/#include +"([^"]+)"/\1/' | while read inc; do
+                [ -f "$d/$inc" ] && cp --parents "$d/$inc" $R/318/
+              done
+            done
+          done
+          # Makefile that lists the teos dtb + msm8920 base files
+          cp --parents arch/arm64/boot/dts/qcom/Makefile $R/318/ 2>/dev/null
+          cp --parents arch/arm/boot/dts/qcom/Makefile $R/318/ 2>/dev/null
+          cp --parents arch/arm/boot/dts/qcom/msm8920*.dts* $R/318/ 2>/dev/null
+          cp --parents arch/arm64/boot/dts/qcom/msm8920*.dts* $R/318/ 2>/dev/null
+          # who uses FT8607 / hall / sensors in the V5 tree
+          grep -rIn -i 'ft8607\|hall\|focaltech' --include='*.dts*' --include='Makefile' --include='Kconfig' . > $R/318/grep_hw.txt 2>/dev/null
+          # defconfig lines that matter
+          grep -E 'CONFIG_(SENSORS|INPUT_|TOUCHSCREEN|MSM_CAMERA|MSMB|LEDS|FB_MSM|MSM_MDSS|MSM_SSC|QPNP)' arch/arm64/configs/teos_defconfig | grep -v '^#' > $R/318/defconfig_hw.txt
+          # ================= 4.19 Lineage tree: what the Mi8937 driver supports =================
+          cd $GITHUB_WORKSPACE/k419
+          cp -r --parents drivers/input/touchscreen/focaltech_touch $R/419/
+          cp --parents drivers/platform/msm/ipa/ipa_v2/ipa_debugfs.c include/linux/thread_info.h $R/419/
+          grep -rIl -i 'ft8607' . > $R/419/grep_ft8607_files.txt 2>/dev/null
+          grep -rIl 'SW_LID' drivers/input > $R/419/grep_hall_files.txt 2>/dev/null
+          ls drivers/video/fbdev/msm 2>/dev/null | grep -i 'panel\|dsi' > $R/419/mdss_panel_files.txt
+          grep -n 'FTS\|FT[0-9]' drivers/input/touchscreen/focaltech_touch/focaltech_config.h > $R/419/fts_chip_defs.txt 2>/dev/null
+          # kernel.config options of the working image that differ from lineage msm8937_defconfig (for review)
+          cp arch/arm64/configs/vendor/msm8937_defconfig $R/419/ 2>/dev/null
+          du -sh $R; find $R -type f | wc -l
+          tar czf $GITHUB_WORKSPACE/recon3.tgz -C $GITHUB_WORKSPACE recon3
+          ls -la $GITHUB_WORKSPACE/recon3.tgz
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: recon3
+          path: recon3.tgz
