@@ -5,7 +5,7 @@ on:
       rom_url:
         description: "Stock ROM link (Google Drive / MediaFire page links or direct URL)"
         required: true
-        default: "https://drive.google.com/file/d/1S8kikSVSJQxat52PziaUJo5KktWk6IHX/view"
+        default: "https://drive.usercontent.google.com/download?id=1B8X_jOufRCJXEnpJ-0O3DSRmYJAWQ7om&export=download&confirm=t&uuid=85bb5621-964e-4c68-8a8c-e0acf4d30590"
 jobs:
   recon7:
     runs-on: ubuntu-24.04
@@ -13,24 +13,25 @@ jobs:
     steps:
       - name: Install tools
         run: |
+          sudo add-apt-repository -y multiverse
           sudo apt-get update -qq
-          sudo apt-get install -y -qq android-sdk-libsparse-utils brotli unzip binutils p7zip-full python3-pip
+          sudo apt-get install -y -qq android-sdk-libsparse-utils brotli unzip binutils unar unrar-free p7zip-full aria2 curl python3-pip
+          sudo apt-get install -y -qq unrar || true
           pip install --break-system-packages -q gdown
       - name: Download
         run: |
           set -e
           mkdir -p $GITHUB_WORKSPACE/rom && cd $GITHUB_WORKSPACE/rom
           URL="${{ inputs.rom_url }}"
-          if echo "$URL" | grep -q 'drive.google.com'; then
-            gdown --fuzzy "$URL" -O rom.bin
-          elif echo "$URL" | grep -q 'mediafire.com/file'; then
-            HTML=$(curl -sL -A 'Mozilla/5.0' "$URL")
-            DL=$(echo "$HTML" | grep -oP 'https://download[0-9]*\.mediafire\.com/[^"'"'"' <>]+' | head -1)
-            [ -z "$DL" ] && { SC=$(echo "$HTML" | grep -oP 'data-scrambled-url="\K[^"]+' | head -1); [ -n "$SC" ] && DL=$(echo "$SC" | base64 -d); }
-            [ -z "$DL" ] && { echo "MediaFire link not resolved"; exit 1; }
-            curl -L --fail --retry 3 -A 'Mozilla/5.0' -o rom.bin "$DL"
+          if echo "$URL" | grep -q 'usercontent.google.com'; then
+            aria2c -x 16 -s 16 -o rom.bin "$URL" || curl -L --fail --retry 3 -A 'Mozilla/5.0' -o rom.bin "$URL"
+          elif echo "$URL" | grep -q 'drive.google.com'; then
+            FILE_ID=$(echo "$URL" | sed -rn 's/.*\/d\/([a-zA-Z0-9_-]+).*/\1/p')
+            [ -z "$FILE_ID" ] && FILE_ID=$(echo "$URL" | sed -rn 's/.*[?&]id=([a-zA-Z0-9_-]+).*/\1/p')
+            DL_URL="https://drive.usercontent.google.com/download?id=${FILE_ID}&export=download&confirm=t"
+            aria2c -x 16 -s 16 -o rom.bin "$DL_URL" || gdown "$FILE_ID" -O rom.bin
           else
-            curl -L --fail --retry 3 -A 'Mozilla/5.0' -o rom.bin "$URL"
+            aria2c -x 16 -s 16 -o rom.bin "$URL" || curl -L --fail --retry 3 -A 'Mozilla/5.0' -o rom.bin "$URL"
           fi
           ls -la rom.bin; file rom.bin | tee filetype.txt
           df -h / | tail -1
@@ -39,17 +40,22 @@ jobs:
           set -e
           cd $GITHUB_WORKSPACE/rom
           if [ "$(head -c 2 rom.bin)" = "PK" ]; then
-            unzip -l rom.bin > ziplist.txt; unzip -q -o rom.bin; rm rom.bin
+            unzip -l rom.bin > ziplist.txt; unzip -q -o rom.bin; rm -f rom.bin
+          elif file rom.bin | grep -qi 'RAR archive'; then
+            unrar x -y rom.bin > 7z_log.txt || unar -f rom.bin > 7z_log.txt
+            rm -f rom.bin
           else
-            7z x -y rom.bin > 7z_log.txt || { echo "unknown archive type"; exit 1; }; rm rom.bin
+            unar -f rom.bin > 7z_log.txt || unrar x -y rom.bin > 7z_log.txt || 7z x -y rom.bin > 7z_log.txt || { echo "unknown archive type"; exit 1; }
+            rm -f rom.bin
           fi
           # nested archives (names may contain spaces); delete each archive after extracting to save disk
           for round in 1 2; do
             find . -maxdepth 5 -type f \( -iname '*.zip' -o -iname '*.rar' -o -iname '*.7z' \) -print0 | while IFS= read -r -d '' z; do
               d="${z%.*}_x"; mkdir -p "$d"
               case "$(echo "$z" | tr 'A-Z' 'a-z')" in
-                *.zip) unzip -l "$z" > "$d/ziplist.txt" 2>&1; unzip -q -o "$z" -d "$d" || true ;;
-                *) 7z x -y -o"$d" "$z" > "$d/7z_log.txt" 2>&1 || true ;;
+                *.zip) unzip -l "$z" > "$d/ziplist.txt" 2>&1; unzip -q -o "$z" -d "$d" || unar -f -o "$d" "$z" || true ;;
+                *.rar) unrar x -y "$z" "$d/" > "$d/7z_log.txt" 2>&1 || unar -f -o "$d" "$z" >> "$d/7z_log.txt" 2>&1 || true ;;
+                *) unar -f -o "$d" "$z" > "$d/7z_log.txt" 2>&1 || 7z x -y -o"$d" "$z" >> "$d/7z_log.txt" 2>&1 || true ;;
               esac
               rm -f "$z"
             done
@@ -140,51 +146,53 @@ jobs:
           W=$GITHUB_WORKSPACE; R=$W/recon7
           mkdir -p $R/files $R/small
           cp $W/rom/file_inventory.txt $W/rom/ziplist.txt $W/rom/filetype.txt $W/rom/convert_log.txt $R/ 2>/dev/null
-          # flashing metadata + partition tables + boot/recovery + small text files from anywhere in the package
           find $W/rom -type f \( -iname '*.xml' -o -iname 'gpt*.bin' -o -iname 'partition*' -o -iname '*.mbn' -o -iname 'updater-script' -o -iname '*.txt' -o -iname '*.cfg' -o -iname '*.sh' -o -iname '*.bat' -o -iname '*.json' -o -iname '*.prop' \) -size -3M -not -name 'file_inventory.txt' -not -name 'ziplist.txt' | head -400 | while IFS= read -r f; do cp --parents "$f" $R/small/ 2>/dev/null; done
-          for b in boot.img recovery.img; do f=$(find $W/rom -name $b | head -1); [ -n "$f" ] && cp "$f" $R/; done
+          for b in boot.img recovery.img; do f=$(find "$W/rom" -name "$b" | head -1); [ -n "$f" ] && cp "$f" "$R/"; done
           find $W/rom -type f -printf '%s %p\n' | sort -k2 > $R/file_inventory_after_unpack.txt
           IMG=$W/rom/system.ext4.img
-          if [ -f $IMG ]; then
+          if [ -f "$IMG" ]; then
             d=$W/mnt_system; mkdir -p $d
-            sudo mount -o loop,ro $IMG $d 2>$R/mount_err.txt && SYS=$d
+            sudo mount -o loop,ro "$IMG" $d 2>$R/mount_err.txt && SYS=$d
             if [ -z "$SYS" ]; then
               sudo dmesg | tail -8 > $R/dmesg_tail.txt
-              dumpe2fs -h $IMG > $R/dumpe2fs.txt 2>&1
-              debugfs -R "ls -l /" $IMG > $R/debugfs_root.txt 2>&1
+              dumpe2fs -h "$IMG" > $R/dumpe2fs.txt 2>&1
+              debugfs -R "ls -l /" "$IMG" > $R/debugfs_root.txt 2>&1
               mkdir -p $W/rootfs
               for p in vendor system/vendor system/bin system/etc system/lib system/lib64 system/build.prop bin etc lib lib64 build.prop; do
                 mkdir -p $W/rootfs/$(dirname $p)
-                debugfs -R "rdump /$p $W/rootfs/$(dirname $p)" $IMG > /dev/null 2>&1
+                debugfs -R "rdump /$p $W/rootfs/$(dirname $p)" "$IMG" > /dev/null 2>&1
               done
               SYS=$W/rootfs
             fi
-            S=$SYS; [ -d $SYS/system/bin ] && S=$SYS/system
+            S=$SYS; [ -d "$SYS/system/bin" ] && S=$SYS/system
             V=$S/vendor; [ -d "$V/lib" ] || V=$SYS/vendor
-            echo "SYS=$SYS S=$S V=$V" > $R/layout.txt; ls $SYS | head -60 > $R/root_ls.txt
+            echo "SYS=$SYS S=$S V=$V" > $R/layout.txt; ls "$SYS" | head -60 > $R/root_ls.txt
             for pair in "system:$S" "vendor:$V"; do
               n=${pair%%:*}; base=${pair#*:}
-              for dd in lib lib64 bin etc; do [ -d $base/$dd ] && (cd $base && find $dd -type f -printf '%s %p\n' | sort -k2) > $R/inv_${n}_$dd.txt; done
-              cp $base/build.prop $R/${n}_build.prop 2>/dev/null
+              for dd in lib lib64 bin etc; do [ -d "$base/$dd" ] && (cd "$base" && find $dd -type f -printf '%s %p\n' | sort -k2) > $R/inv_${n}_$dd.txt; done
+              cp "$base/build.prop" $R/${n}_build.prop 2>/dev/null
               mkdir -p $R/files/$n
-              (cd $base && tar cf - etc/vintf manifest.xml etc/init etc/*.xml etc/*.conf etc/permissions init*.rc 2>/dev/null) | tar xf - -C $R/files/$n
-              (cd $base && find lib/hw lib64/hw bin/hw -type f 2>/dev/null) > $R/hal_list_$n.txt
-              (cd $base && tar cf - -T $R/hal_list_$n.txt 2>/dev/null) | tar xf - -C $R/files/$n
-              (cd $base && find . -name '*.ko' 2>/dev/null) > $R/ko_list_$n.txt
-              (cd $base && tar cf - -T $R/ko_list_$n.txt 2>/dev/null) | tar xf - -C $R/files/$n
+              (cd "$base" && tar cf - etc/vintf manifest.xml etc/init etc/*.xml etc/*.conf etc/permissions init*.rc 2>/dev/null) | tar xf - -C $R/files/$n
+              (cd "$base" && find lib/hw lib64/hw bin/hw -type f 2>/dev/null) > $R/hal_list_$n.txt
+              (cd "$base" && tar cf - -T $R/hal_list_$n.txt 2>/dev/null) | tar xf - -C $R/files/$n
+              (cd "$base" && find . -name '*.ko' 2>/dev/null) > $R/ko_list_$n.txt
+              (cd "$base" && tar cf - -T $R/ko_list_$n.txt 2>/dev/null) | tar xf - -C $R/files/$n
             done
-            find $R/files -type f | while read f; do file "$f" | grep -q ELF || continue; echo "== ${f#$R/files/}"; readelf -d "$f" 2>/dev/null | grep NEEDED | sed 's/.*\[\(.*\)\]/\1/'; done > $R/needed_collected.txt
+            find $R/files -type f | while IFS= read -r f; do file "$f" | grep -q ELF || continue; echo "== ${f#$R/files/}"; readelf -d "$f" 2>/dev/null | grep NEEDED | sed 's/.*\[\(.*\)\]/\1/'; done > $R/needed_collected.txt
             sudo umount $d 2>/dev/null
           fi
-          if [ -f $W/rom/oem.ext4.img ]; then
-            file $W/rom/oem.ext4.img > $R/oem_file.txt
-            mkdir -p $W/mnt_oem
-            if sudo mount -o loop,ro $W/rom/oem.ext4.img $W/mnt_oem 2>$R/oem_mount_err.txt; then
-              (cd $W/mnt_oem && find . -type f -printf '%s %p\n' | sort -k2 | head -3000) > $R/inv_oem.txt
-              df -h $W/mnt_oem | tail -1 > $R/oem_df.txt
-              sudo umount $W/mnt_oem
-            else
-              debugfs -R "ls -l /" $W/rom/oem.ext4.img > $R/oem_debugfs_root.txt 2>&1
+          if [ -f "$W/rom/oem.ext4.img`" ] || [ -f "$W/rom/oem.ext4.img" ]; then
+            OEM_IMG=$(find $W/rom -name 'oem.ext4.img' -o -name 'oem.img' | head -1)
+            if [ -n "$OEM_IMG" ]; then
+              file "$OEM_IMG" > $R/oem_file.txt
+              mkdir -p $W/mnt_oem
+              if sudo mount -o loop,ro "$OEM_IMG" $W/mnt_oem 2>$R/oem_mount_err.txt; then
+                (cd $W/mnt_oem && find . -type f -printf '%s %p\n' | sort -k2 | head -3000) > $R/inv_oem.txt
+                df -h $W/mnt_oem | tail -1 > $R/oem_df.txt
+                sudo umount $W/mnt_oem
+              else
+                debugfs -R "ls -l /" "$OEM_IMG" > $R/oem_debugfs_root.txt 2>&1
+              fi
             fi
           fi
           du -sh $R; find $R -type f | wc -l
