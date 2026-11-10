@@ -1,0 +1,74 @@
+name: recon-sources
+on:
+  workflow_dispatch:
+    inputs:
+      branch419:
+        description: "4.19 kernel branch (LineageOS msm8937)"
+        default: "lineage-23.2"
+      branch318:
+        description: "Codeberg vestel 3.18 branch"
+        default: "lineage-18.1"
+jobs:
+  recon:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Clone sources
+        run: |
+          git clone --depth 1 --branch "${{ inputs.branch419 }}" https://github.com/LineageOS/android_kernel_xiaomi_msm8937 k419
+          git clone --depth 1 --branch "${{ inputs.branch318 }}" https://codeberg.org/kurtbahartr/android_kernel_vestel_msm8920 k318
+      - name: Collect what we need to port TEOS
+        run: |
+          set +e
+          mkdir -p recon/419 recon/318
+          R=$PWD/recon
+          cp_list () { # repo listfile destdir
+            (cd "$1" && xargs -a "$2" -r -I{} sh -c 'test -f "{}" && [ $(stat -c%s "{}") -lt 3000000 ] && cp --parents "{}" "'"$3"'"')
+          }
+          # ---------- 4.19 tree ----------
+          cd $GITHUB_WORKSPACE/k419
+          sed -n 1,5p Makefile > $R/419/version.txt
+          git log -1 --format='%H %s' >> $R/419/version.txt
+          git ls-files | grep -E 'arch/arm64/boot/dts/qcom/.*(pmi8950|land|ugglite|ugg|rolex|santoni|msm8917|msm8937|msm-pm8937|msm-pmi)' > $R/419/dts.list
+          git ls-files | grep -E 'arch/arm64/configs/.*' > $R/419/defconfigs.list
+          git ls-files arch/arm64/boot/dts | grep -E 'Makefile$' > $R/419/dts_makefiles.list
+          cp_list . $R/419/dts.list $R/419
+          cp_list . $R/419/dts_makefiles.list $R/419
+          grep -rl 'fts_ts-mi8937\|focaltech,fts' drivers arch/arm64/boot/dts 2>/dev/null > $R/419/touch.list
+          grep -rl 'ibb\|labibb' drivers/regulator 2>/dev/null | head -5 >> $R/419/touch.list
+          cp_list . $R/419/touch.list $R/419
+          git ls-files drivers/input/touchscreen | grep -i -E 'focal|fts|ft[0-9]' > $R/419/ts_src.list
+          cp_list . $R/419/ts_src.list $R/419
+          ls drivers/input/touchscreen > $R/419/ts_dir.txt
+          ls drivers/media/platform/msm drivers/media/platform/msm/camera_v2 2>/dev/null > $R/419/camera_dirs.txt
+          grep -rn 'imx258\|qcom,cci\|qcom,csid' drivers arch/arm64/boot/dts --include=*.c --include=*.dtsi --include=*.dts 2>/dev/null | head -60 > $R/419/camera_grep.txt
+          grep -n -B2 -A14 'config MSM_CAMERA' drivers/media/platform/msm/Kconfig drivers/media/platform/msm/camera*/Kconfig 2>/null > $R/419/camera_kconfig.txt
+          grep -rn 'usb_power_supply\|msm_usb_psy\|extcon' arch/arm64/boot/dts/qcom/*8937* arch/arm64/boot/dts/qcom/*8917* arch/arm64/boot/dts/qcom/*mi8937* 2>/dev/null | head -60 > $R/419/usb_grep.txt
+          grep -rln 'qpnp-smbcharger\|qpnp-fg' drivers arch/arm64/boot/dts 2>/dev/null | head -40 > $R/419/charger_files.list
+          cp_list . $R/419/charger_files.list $R/419
+          ls Documentation/devicetree/bindings/power/supply/qcom 2>/dev/null > $R/419/charger_bindings.txt
+          grep -rn 'hall' drivers/input arch/arm64/boot/dts/qcom 2>/dev/null | head -30 > $R/419/hall_grep.txt
+          # ---------- 3.18 Vestel tree ----------
+          cd $GITHUB_WORKSPACE/k318
+          sed -n 1,5p Makefile > $R/318/version.txt
+          git log -1 --format='%H %s' >> $R/318/version.txt
+          git grep -l -i 'teos' > $R/318/teos_files.list
+          git grep -l 'Sharp_FT8607\|focaltech,fts"\|hall-switch\|imx258' -- drivers arch include firmware > $R/318/driver_files.list
+          cat $R/318/driver_files.list $R/318/teos_files.list | sort -u > $R/318/copy.list
+          cp_list . $R/318/copy.list $R/318
+          git ls-files drivers/input/touchscreen > $R/318/ts_all.list
+          git ls-files drivers/input/misc | grep -i hall > $R/318/hall_files.list
+          cp_list . $R/318/hall_files.list $R/318
+          git ls-files drivers/media/platform/msm | grep -i -E 'imx258|teos' > $R/318/cam_teos.list
+          cp_list . $R/318/cam_teos.list $R/318
+          git grep -n -i 'teos' -- arch/arm64/configs arch/arm/boot/dts/qcom/Makefile > $R/318/teos_config_refs.txt
+          cp arch/arm64/configs/teos_defconfig $R/318/ 2>/dev/null
+          du -sh $R > $R/size.txt; cat $R/size.txt
+          find $R -type f | wc -l
+          tar czf $GITHUB_WORKSPACE/recon.tgz -C $GITHUB_WORKSPACE recon
+          ls -la $GITHUB_WORKSPACE/recon.tgz
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: recon
+          path: recon.tgz
