@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
     inputs:
       rom_url:
-        description: "ROM zip / system.img link (MediaFire file page links are resolved automatically)"
+        description: "ROM zip / system.img link (https://www.mediafire.com/file/orrzaiplncdv6rt/Kasumi-1.5-PoPiPa-20260817-OFFICIAL-GApps-teos.zip/file?action=check)"
         required: true
 jobs:
   recon6:
