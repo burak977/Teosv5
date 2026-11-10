@@ -1,0 +1,40 @@
+name: build-teos-kernel
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Kernel branch"
+        default: "lineage-23.2"
+      repo:
+        description: "Kernel repo URL"
+        default: "https://github.com/LineageOS/android_kernel_xiaomi_msm8937"
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unpack assets
+        run: tar xzf assets.tar.gz
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld llvm gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+            bc bison flex libssl-dev libelf-dev cpio python3 xz-utils zstd
+      - name: Build kernel and pack boot image
+        env:
+          BRANCH: ${{ inputs.branch }}
+          REPO: ${{ inputs.repo }}
+        run: bash build.sh
+      - name: Show errors in summary
+        if: failure()
+        run: |
+          echo '### Build errors' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep -n -E 'error|Error 1|undefined|fatal' artifacts/build.log | head -40 >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: teos-boot
+          path: artifacts/
