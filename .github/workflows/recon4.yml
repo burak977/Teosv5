@@ -1,0 +1,35 @@
+name: recon4-sources
+on:
+  workflow_dispatch:
+    inputs:
+      branch419:
+        description: "4.19 kernel branch (LineageOS msm8937)"
+        default: "lineage-23.2"
+jobs:
+  recon4:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Clone
+        run: git clone --depth 1 --branch "${{ inputs.branch419 }}" https://github.com/LineageOS/android_kernel_xiaomi_msm8937 k419
+      - name: Collect round 4
+        run: |
+          set +e
+          R=$GITHUB_WORKSPACE/recon4
+          mkdir -p $R
+          cd $GITHUB_WORKSPACE/k419
+          # Mi8937 touch driver actually used by the working kernel (CONFIG_TOUCHSCREEN_FTS_MI8937)
+          cp -r --parents techpack/xiaomi-msm8937/touchscreen $R/
+          cp --parents techpack/xiaomi-msm8937/Makefile techpack/xiaomi-msm8937/Kconfig $R/ 2>/dev/null
+          # does the tree know the V5 camera sensor / a hall driver / the hall-switch compatible?
+          grep -rIl -i 'imx258' . --include='*.c' --include='*.h' --include='*.dts*' --include='*.xml' > $R/grep_imx258.txt 2>/dev/null
+          grep -rIl 'hall-switch' . > $R/grep_hall_switch.txt 2>/dev/null
+          grep -rIn 'FTS_MI8937\|HALL' arch/arm64/configs/vendor drivers/input/Kconfig techpack 2>/dev/null | head -50 > $R/grep_cfg.txt
+          # build log of the failing IPA error would help too: re-run the single object
+          ls -la $R; find $R -type f | wc -l
+          tar czf $GITHUB_WORKSPACE/recon4.tgz -C $GITHUB_WORKSPACE recon4
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: recon4
+          path: recon4.tgz
