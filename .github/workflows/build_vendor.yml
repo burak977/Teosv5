@@ -1,0 +1,121 @@
+name: build-vendor-img
+on:
+  workflow_dispatch:
+    inputs:
+      rom_url:
+        description: "DIRECT download link of the A11 ROM zip (mediafire: download*.mediafire.com/... link; or any direct URL)"
+        required: true
+      vendor_mb:
+        description: "Size of vendor.img in MiB (must be <= the vendor partition you create)"
+        default: "768"
+      patch_vintf:
+        description: "Patch manifest target-level to 5 and add ro.vndk.version=30 (true/false)"
+        default: "true"
+jobs:
+  vendor:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Install tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq android-sdk-libsparse-utils brotli unzip aria2 curl rsync e2fsprogs python3
+      - name: Download and unpack ROM
+        run: |
+          set -e
+          mkdir -p $GITHUB_WORKSPACE/rom && cd $GITHUB_WORKSPACE/rom
+          URL="${{ inputs.rom_url }}"
+          if echo "$URL" | grep -q 'mediafire.com/file'; then
+            HTML=$(curl -sL -A 'Mozilla/5.0' "$URL")
+            DL=$(echo "$HTML" | grep -oP 'https://download[0-9]*\.mediafire\.com/[^"'"'"' <>]+' | head -1)
+            [ -z "$DL" ] && { SC=$(echo "$HTML" | grep -oP 'data-scrambled-url="\K[^"]+' | head -1); [ -n "$SC" ] && DL=$(echo "$SC" | base64 -d); }
+            [ -z "$DL" ] && { echo "MediaFire page link not resolved; use the direct download link"; exit 1; }
+            URL="$DL"
+          fi
+          aria2c -x 16 -s 16 -o rom.bin "$URL" || curl -L --fail --retry 3 -A 'Mozilla/5.0' -o rom.bin "$URL"
+          ls -la rom.bin; file rom.bin
+          [ "$(head -c 2 rom.bin)" = "PK" ] || { echo "downloaded file is not a zip"; exit 1; }
+          unzip -q -o rom.bin 'system.*' 'META-INF/*' 'boot.img' 'dtbo.img' 2>/dev/null || unzip -q -o rom.bin
+          rm -f rom.bin
+          ls -la
+          cat > sdat2img.py <<'PY'
+          import sys,os
+          tl,dat,out=sys.argv[1:4]
+          L=open(tl).read().split('\n')
+          ver=int(L[0]); total=int(L[1])
+          start=2 if ver==1 else 4
+          def rs(s):
+              n=[int(x) for x in s.split(',')]
+              assert len(n)==n[0]+1
+              return [(n[i],n[i+1]) for i in range(1,len(n),2)]
+          with open(out,'wb') as o, open(dat,'rb') as d:
+              o.truncate(total*4096)
+              for line in L[start:]:
+                  p=line.split(' ')
+                  if p[0]=='new':
+                      for b,e in rs(p[1]):
+                          o.seek(b*4096); n=(e-b)*4096
+                          while n>0:
+                              c=d.read(min(n,1<<20))
+                              if not c: raise SystemExit('dat truncated')
+                              o.write(c); n-=len(c)
+          print('ok',total*4096)
+          PY
+          brotli -d -f system.new.dat.br
+          python3 sdat2img.py system.transfer.list system.new.dat system.ext4.img
+          rm -f system.new.dat
+          # the filesystem inside is 4 GiB but the data only reaches the last written block: pad so the kernel accepts the mount
+          truncate -s 4G system.ext4.img
+          dumpe2fs -h system.ext4.img 2>/dev/null | grep -E 'Block count|Block size|features'
+      - name: Mount and copy /system/vendor with SELinux labels
+        run: |
+          set -e
+          W=$GITHUB_WORKSPACE
+          mkdir -p $W/mnt $W/vendor_tree
+          sudo mount -o loop,ro $W/rom/system.ext4.img $W/mnt
+          V=$W/mnt/system/vendor; [ -d "$V/lib" ] || V=$W/mnt/vendor
+          [ -d "$V/lib" ] || { echo "vendor directory not found"; ls $W/mnt; exit 1; }
+          echo "vendor source: $V"
+          sudo rsync -aAX --numeric-ids "$V"/ $W/vendor_tree/
+          sudo umount $W/mnt
+          sudo du -sm $W/vendor_tree | tee $W/tree_size.txt
+          sudo find $W/vendor_tree -type f | wc -l
+          # keep an untouched copy of the files we patch
+          mkdir -p $W/out
+          sudo cp $W/vendor_tree/etc/vintf/manifest.xml $W/out/manifest.orig.xml 2>/dev/null || true
+          sudo cp $W/vendor_tree/build.prop $W/out/build.orig.prop 2>/dev/null || true
+      - name: Patch (in place, keeps xattrs) and build vendor.img
+        run: |
+          set -e
+          W=$GITHUB_WORKSPACE
+          if [ "${{ inputs.patch_vintf }}" = "true" ]; then
+            sudo python3 - <<'PYX'
+          import re,os
+          root=os.environ['GITHUB_WORKSPACE']+'/vendor_tree'
+          def edit(path,fn):
+              if not os.path.exists(path): print('missing',path); return
+              with open(path,'r+') as f:
+                  s=f.read(); n=fn(s)
+                  if n!=s:
+                      f.seek(0); f.write(n); f.truncate(); print('patched',path)
+                  else: print('unchanged',path)
+          edit(root+'/etc/vintf/manifest.xml', lambda s: s.replace('target-level="legacy"','target-level="5"'))
+          edit(root+'/build.prop', lambda s: s if 'ro.vndk.version' in s else s.rstrip('\n')+'\nro.vndk.version=30\n')
+          PYX
+          fi
+          SZ=$(sudo du -sm $W/vendor_tree | cut -f1); MB=${{ inputs.vendor_mb }}
+          echo "tree ${SZ} MiB, image ${MB} MiB"
+          [ "$SZ" -lt "$MB" ] || { echo "vendor_mb too small"; exit 1; }
+          sudo mke2fs -q -t ext4 -b 4096 -m 0 -L vendor -O ^has_journal -E root_owner=0:0 -d $W/vendor_tree $W/out/vendor.img ${MB}M
+          sudo e2fsck -fn $W/out/vendor.img | tail -3 | tee $W/out/fsck.txt
+          # verify that SELinux labels survived on a few files
+          for p in /etc/vintf/manifest.xml /bin/hw/android.hardware.graphics.composer@2.1-service /lib64/hw/hwcomposer.msm8937.so /etc/selinux/vendor_file_contexts; do
+            echo "== $p"; debugfs -R "ea_list $p" $W/out/vendor.img 2>&1 | grep -v '^debugfs' | head -3
+          done | tee $W/out/xattr_check.txt
+          sudo cp $W/vendor_tree/etc/vintf/manifest.xml $W/out/manifest.patched.xml 2>/dev/null || true
+          sudo chown -R $(id -u):$(id -g) $W/out
+          sha256sum $W/out/vendor.img | tee $W/out/vendor.img.sha256
+          ls -la $W/out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vendor-img
+          path: out/
+          compression-level: 9
