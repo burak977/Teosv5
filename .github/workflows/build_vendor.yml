@@ -3,7 +3,8 @@ on:
   workflow_dispatch:
     inputs:
       rom_url:
-        description: "DIRECT download link of the A11 ROM zip (mediafire: download*.mediafire.com/... link; or any direct URL)"
+        description: "A11 ROM zip link (MediaFire page or direct URL)"
+        default: "https://www.mediafire.com/file/orrzaiplncdv6rt/Kasumi-1.5-PoPiPa-20260817-OFFICIAL-GApps-teos.zip/file"
         required: true
       vendor_mb:
         description: "Size of vendor.img in MiB (must be <= the vendor partition you create)"
@@ -17,18 +18,31 @@ jobs:
     timeout-minutes: 120
     steps:
       - name: Install tools
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq android-sdk-libsparse-utils brotli unzip aria2 curl rsync e2fsprogs python3
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq android-sdk-libsparse-utils brotli unzip aria2 curl rsync e2fsprogs python3 python3-pip
+          pip install playwright --break-system-packages -q
+          playwright install chromium
+
       - name: Download and unpack ROM
         run: |
           set -e
           mkdir -p $GITHUB_WORKSPACE/rom && cd $GITHUB_WORKSPACE/rom
-          URL="${{ inputs.rom_url }}"
-          if echo "$URL" | grep -q 'mediafire.com/file'; then
-            HTML=$(curl -sL -A 'Mozilla/5.0' "$URL")
-            DL=$(echo "$HTML" | grep -oP 'https://download[0-9]*\.mediafire\.com/[^"'"'"' <>]+' | head -1)
-            [ -z "$DL" ] && { SC=$(echo "$HTML" | grep -oP 'data-scrambled-url="\K[^"]+' | head -1); [ -n "$SC" ] && DL=$(echo "$SC" | base64 -d); }
-            [ -z "$DL" ] && { echo "MediaFire page link not resolved; use the direct download link"; exit 1; }
-            URL="$DL"
+          URL=$(echo "${{ inputs.rom_url }}" | sed 's/^Https:/https:/I')
+          if echo "$URL" | grep -qi 'mediafire.com/file'; then
+            cat > get_dl.py <<'EOF'
+          import sys
+          from playwright.sync_api import sync_playwright
+          with sync_playwright() as p:
+              b = p.chromium.launch(headless=True)
+              page = b.new_page()
+              page.goto(sys.argv[1], wait_until="domcontentloaded", timeout=60000)
+              page.wait_for_selector("a#downloadButton", timeout=30000)
+              print(page.get_attribute("a#downloadButton", "href"))
+              b.close()
+          EOF
+            URL=$(python3 get_dl.py "$URL" | tail -n 1)
+            echo "Resolved MediaFire URL: $URL"
           fi
           aria2c -x 16 -s 16 -o rom.bin "$URL" || curl -L --fail --retry 3 -A 'Mozilla/5.0' -o rom.bin "$URL"
           ls -la rom.bin; file rom.bin
@@ -65,6 +79,7 @@ jobs:
           # the filesystem inside is 4 GiB but the data only reaches the last written block: pad so the kernel accepts the mount
           truncate -s 4G system.ext4.img
           dumpe2fs -h system.ext4.img 2>/dev/null | grep -E 'Block count|Block size|features'
+
       - name: Mount and copy /system/vendor with SELinux labels
         run: |
           set -e
@@ -82,14 +97,15 @@ jobs:
           mkdir -p $W/out
           sudo cp $W/vendor_tree/etc/vintf/manifest.xml $W/out/manifest.orig.xml 2>/dev/null || true
           sudo cp $W/vendor_tree/build.prop $W/out/build.orig.prop 2>/dev/null || true
+
       - name: Patch (in place, keeps xattrs) and build vendor.img
         run: |
           set -e
           W=$GITHUB_WORKSPACE
           if [ "${{ inputs.patch_vintf }}" = "true" ]; then
-            sudo python3 - <<'PYX'
-          import re,os
-          root=os.environ['GITHUB_WORKSPACE']+'/vendor_tree'
+            sudo -E python3 - "$W/vendor_tree" <<'PYX'
+          import sys,os
+          root=sys.argv[1]
           def edit(path,fn):
               if not os.path.exists(path): print('missing',path); return
               with open(path,'r+') as f:
@@ -108,12 +124,13 @@ jobs:
           sudo e2fsck -fn $W/out/vendor.img | tail -3 | tee $W/out/fsck.txt
           # verify that SELinux labels survived on a few files
           for p in /etc/vintf/manifest.xml /bin/hw/android.hardware.graphics.composer@2.1-service /lib64/hw/hwcomposer.msm8937.so /etc/selinux/vendor_file_contexts; do
-            echo "== $p"; debugfs -R "ea_list $p" $W/out/vendor.img 2>&1 | grep -v '^debugfs' | head -3
+            echo "== $p"; sudo debugfs -R "ea_list $p" $W/out/vendor.img 2>&1 | grep -v '^debugfs' | head -3
           done | tee $W/out/xattr_check.txt
           sudo cp $W/vendor_tree/etc/vintf/manifest.xml $W/out/manifest.patched.xml 2>/dev/null || true
           sudo chown -R $(id -u):$(id -g) $W/out
           sha256sum $W/out/vendor.img | tee $W/out/vendor.img.sha256
           ls -la $W/out
+
       - uses: actions/upload-artifact@v4
         with:
           name: vendor-img
